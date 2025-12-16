@@ -1,56 +1,86 @@
 import zmq
+import json
+import psycopg2
+import signal
+import sys
+
+DB_CONFIG = {
+    "dbname": "mobile_measurements",
+    "user": "evlnka",
+    "password": "1234",
+    "host": "localhost",
+    "port": "5432"
+}
+
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C для завершения
 
 def main():
-    packet_count = 0
-    
-    # Загружаем предыдущее количество пакетов из файла
-    try:
-        with open("data.txt", "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            packet_count = len(lines)
-            print(f"Загружено {packet_count} предыдущих пакетов")
-    except FileNotFoundError:
-        packet_count = 0
-        print("Файл не найден, начинаем с 0")
-    
+    global running
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind("tcp://*:2222")
-    
+
     print("Сервер запущен на порту 2222")
-    print("Ожидание подключения...")
-    
+    print("Ожидание данных...\n")
+
     try:
-        while True:
-            # Получаем данные от Android
-            message = socket.recv_string()
-            print(f"Получено: {message}")
+        while running:
+            try:
+                # Проверяем, есть ли сообщение без блокировки
+                if socket.poll(timeout=1000):  # таймаут 1 секунда
+                    message = socket.recv_string()
+                    data = json.loads(message)
+                    records = data if isinstance(data, list) else [data]
 
-            # Увеличиваем счетчик пакетов
-            packet_count += 1
-            
-            # СОХРАНЯЕМ каждый блок данных в файл
-            with open("data.txt", "a", encoding="utf-8") as f:
-                f.write(f"Пакет #{packet_count}: {message}\n")
-            
-            print(f"Сохранено в файл: Пакет #{packet_count}")
+                    for record in records:
+                        cur.execute(
+                            """
+                            INSERT INTO measurements (
+                                latitude, longitude, altitude, timestamp, accuracy,
+                                network_type, tac_lac, pci_bsic_psc,
+                                ci, earfcn_arfcn, signal
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                record.get("latitude"),
+                                record.get("longitude"),
+                                record.get("altitude"),
+                                record.get("timestamp"),
+                                record.get("accuracy"),
+                                record.get("networkType"),
+                                record.get("tac_lac"),
+                                record.get("pci_bsic_psc"),
+                                record.get("ci"),
+                                record.get("earfcn_arfcn"),
+                                record.get("signal"),
+                            )
+                        )
 
-            # Отправляем ответ
-            socket.send_string("Hello from Server!")
-            
-            # Выводим количество полученных пакетов
-            print(f"Всего получено пакетов: {packet_count}")
-            
-            # Показываем все сохраненные данные
-            print("Все данные из файла:")
-            with open("data.txt", "r", encoding="utf-8") as f:
-                print(f.read())
-            
-    except KeyboardInterrupt:
-        print(f"\nСервер остановлен. Итоговое количество пакетов: {packet_count}")
+                    conn.commit()
+                    socket.send_string(f" Сохранено {len(records)} записей")
+                    print(f"Сохранено {len(records)} записей в БД")
+
+            except Exception as e:
+                conn.rollback()
+                print("Ошибка:", e)
+                socket.send_string("ERROR")
+
     finally:
+        cur.close()
+        conn.close()
         socket.close()
         ctx.term()
+        print("Сервер остановлен")
 
 if __name__ == "__main__":
     main()
